@@ -95,6 +95,54 @@ impl GrokRequestHeaders<'_> {
 /// document's own top-level `type`, so an unknown variant nested somewhere
 /// inside an event we care about (say a `response.completed`) still surfaces
 /// as a hard error instead of being silently dropped.
+/// Whether `base_url` points at an endpoint that can serve xAI-proprietary
+/// hosted tools.
+///
+/// Backend search ships two hosted tools whenever a model sets
+/// `supports_backend_search`: `web_search`, which is part of the Responses
+/// API that any compatible provider implements, and `x_search`, which is
+/// xAI-only. A third-party Responses endpoint is a legitimate target for the
+/// former but rejects the latter with `400 Unsupported tool type: x_search` —
+/// and because that fails request validation, it takes down every turn, not
+/// just searches. Send `x_search` only where it exists.
+///
+/// This is a per-tool decision, not a per-request one: see
+/// [`extra_tool_entries_for_endpoint`].
+fn endpoint_serves_xai_hosted_tools(base_url: &str) -> bool {
+    reqwest::Url::parse(base_url)
+        .ok()
+        .and_then(|url| url.host_str().map(str::to_owned))
+        .is_some_and(|host| {
+            host == "x.ai" || host.ends_with(".x.ai") || host.ends_with(".grok.com")
+        })
+}
+
+/// Hosted tools that only xAI-operated endpoints serve.
+const XAI_ONLY_HOSTED_TOOLS: &[&str] = &["x_search"];
+
+/// The raw-JSON hosted-tool entries to splice into a request bound for
+/// `base_url`, with xAI-only tools filtered out for everyone else.
+///
+/// The filter has to be per tool. Upstream moved `web_search` onto this same
+/// raw-JSON channel (its typed `rs::Tool` form cannot express
+/// `excluded_domains`), so `web_search` and `x_search` now travel together and
+/// dropping the whole list would take backend web search down alongside
+/// `x_search` on a third-party gateway.
+fn extra_tool_entries_for_endpoint(
+    base_url: &str,
+    hosted_tools: &[xai_grok_sampling_types::HostedTool],
+) -> Vec<serde_json::Value> {
+    if endpoint_serves_xai_hosted_tools(base_url) {
+        return xai_grok_sampling_types::extra_tool_entries(hosted_tools);
+    }
+    let portable: Vec<_> = hosted_tools
+        .iter()
+        .filter(|t| !XAI_ONLY_HOSTED_TOOLS.contains(&t.wire_name()))
+        .cloned()
+        .collect();
+    xai_grok_sampling_types::extra_tool_entries(&portable)
+}
+
 /// Backfill `action` on an in-progress `web_search_call` output item.
 ///
 /// async-openai models `WebSearchToolCall::action` as required, but the
@@ -1937,8 +1985,10 @@ impl SamplingClient {
         let x_grok_transient_retry = request.x_grok_transient_retry.clone();
         let x_grok_agent_id = request.x_grok_agent_id.clone();
 
-        // The hosted tools travel as raw JSON, spliced in after serialization by `splice_extra_tool_entries`, whose doc explains why each one does
-        let extra_tools = xai_grok_sampling_types::extra_tool_entries(&request.hosted_tools);
+        // The hosted tools travel as raw JSON, spliced in after serialization by
+        // `splice_extra_tool_entries`, whose doc explains why each one does.
+        // Filtered for the endpoint: x_search only goes where it is served.
+        let extra_tools = extra_tool_entries_for_endpoint(&self.base_url, &request.hosted_tools);
 
         let responses_request: rs::CreateResponse = (&request).into();
 
@@ -1973,8 +2023,10 @@ impl SamplingClient {
         let x_grok_transient_retry = request.x_grok_transient_retry.clone();
         let x_grok_agent_id = request.x_grok_agent_id.clone();
 
-        // The hosted tools travel as raw JSON, spliced in by `create_response` via `splice_extra_tool_entries`, whose doc explains why
-        let extra_tools = xai_grok_sampling_types::extra_tool_entries(&request.hosted_tools);
+        // The hosted tools travel as raw JSON, spliced in by `create_response` through
+        // `splice_extra_tool_entries`, whose doc explains why each one does.
+        // Filtered for the endpoint: x_search only goes where it is served.
+        let extra_tools = extra_tool_entries_for_endpoint(&self.base_url, &request.hosted_tools);
 
         let responses_request: rs::CreateResponse = (&request).into();
 
@@ -3059,6 +3111,62 @@ mod tests {
                 "{data} should be treated as a skippable unknown event"
             );
         }
+    }
+
+    /// `x_search` ships only to xAI-operated endpoints; a third-party
+    /// Responses endpoint would reject the whole request over it.
+    #[test]
+    fn xai_hosted_tools_only_ship_to_xai_endpoints() {
+        for url in [
+            "https://api.x.ai/v1",
+            "https://x.ai/v1",
+            "https://cli-chat-proxy.grok.com/v1",
+        ] {
+            assert!(
+                endpoint_serves_xai_hosted_tools(url),
+                "{url} is xAI-operated"
+            );
+        }
+        for url in [
+            "http://100.70.0.91:18890/v1",
+            "https://api.openai.com/v1",
+            "http://localhost:8080/v1",
+            "not a url",
+        ] {
+            assert!(
+                !endpoint_serves_xai_hosted_tools(url),
+                "{url} cannot serve x_search"
+            );
+        }
+    }
+
+    /// `web_search` and `x_search` ride the same raw-JSON channel, so the
+    /// endpoint filter has to drop only the xAI-only one. Gating the whole
+    /// list would silently disable backend web search on a third-party
+    /// gateway — the failure this test exists to catch.
+    #[test]
+    fn non_xai_endpoints_keep_web_search_and_drop_x_search() {
+        let hosted = vec![
+            xai_grok_sampling_types::HostedTool::WebSearch { options: None },
+            xai_grok_sampling_types::HostedTool::XSearch { options: None },
+        ];
+        let wire_types = |url: &str| -> Vec<String> {
+            extra_tool_entries_for_endpoint(url, &hosted)
+                .iter()
+                .filter_map(|e| e.get("type").and_then(|v| v.as_str()).map(str::to_owned))
+                .collect()
+        };
+
+        assert_eq!(
+            wire_types("https://api.x.ai/v1"),
+            vec!["web_search", "x_search"],
+            "an xAI endpoint serves both"
+        );
+        assert_eq!(
+            wire_types("http://100.70.0.91:18890/v1"),
+            vec!["web_search"],
+            "a gateway keeps web_search and loses x_search"
+        );
     }
 
     /// A server-side search opens with an `output_item.added` whose
