@@ -99,6 +99,32 @@ impl GrokRequestHeaders<'_> {
 /// `ResponseUsage` unchanged so billing telemetry stays correct. When
 /// the API doesn't emit `context_details` (older deployments) `total_tokens`
 /// passes through unchanged.
+/// True when the payload failed to parse because its **top-level** `type` is
+/// an event this build doesn't know (e.g. a gateway's `keepalive` heartbeat,
+/// or a newer `response.metadata`), as opposed to a malformed payload for an
+/// event we do know.
+///
+/// Serde reports the former as ``unknown variant `keepalive`, expected one of
+/// ...``. We additionally require that the rejected variant is exactly the
+/// document's own top-level `type`, so an unknown variant nested somewhere
+/// inside an event we care about (say a `response.completed`) still surfaces
+/// as a hard error instead of being silently dropped.
+fn is_unknown_top_level_event(data: &str, err: &serde_json::Error) -> bool {
+    let message = err.to_string();
+    let Some(rest) = message.strip_prefix("unknown variant `") else {
+        return false;
+    };
+    let Some((variant, _)) = rest.split_once('`') else {
+        return false;
+    };
+    serde_json::from_str::<serde_json::Value>(data)
+        .ok()
+        .as_ref()
+        .and_then(|v| v.get("type"))
+        .and_then(serde_json::Value::as_str)
+        .is_some_and(|top_level| top_level == variant)
+}
+
 fn deserialize_response_event(data: &str) -> Result<rs::ResponseStreamEvent> {
     let mut event = match serde_json::from_str::<rs::ResponseStreamEvent>(data) {
         Ok(event) => event,
@@ -120,11 +146,21 @@ fn deserialize_response_event(data: &str) -> Result<rs::ResponseStreamEvent> {
                     return Ok(event);
                 }
             }
-            tracing::error!(
-                error = %first_err,
-                raw_data = %data,
-                "Failed to deserialize ResponseStreamEvent from stream"
-            );
+            if is_unknown_top_level_event(data, &first_err) {
+                // Forward-compatibility: the caller swallows these rather than
+                // failing the turn.
+                tracing::warn!(
+                    error = %first_err,
+                    raw_data = %data,
+                    "Unknown ResponseStreamEvent type in stream"
+                );
+            } else {
+                tracing::error!(
+                    error = %first_err,
+                    raw_data = %data,
+                    "Failed to deserialize ResponseStreamEvent from stream"
+                );
+            }
             return Err(SamplingError::Serialization(first_err));
         }
     };
@@ -1494,7 +1530,19 @@ impl SamplingClient {
                         } else if let Some(stream_error) = try_parse_stream_error(data) {
                             Some(Some(Err(stream_error)))
                         } else {
-                            Some(Some(deserialize_response_event(data)))
+                            match deserialize_response_event(data) {
+                                // An event type this build doesn't model (a
+                                // gateway heartbeat, or one added upstream
+                                // after this release) carries nothing we act
+                                // on, so skip it and keep the stream alive
+                                // rather than failing the whole turn.
+                                Err(SamplingError::Serialization(ref err))
+                                    if is_unknown_top_level_event(data, err) =>
+                                {
+                                    Some(None)
+                                }
+                                result => Some(Some(result)),
+                            }
                         }
                     }
                     Err(e) => {
@@ -2815,6 +2863,56 @@ mod tests {
         client.record_401_attribution(
             crate::attribution::SamplingConsumer::ChatCompletions,
             Some("bearer-tail-12"),
+        );
+    }
+
+    /// A gateway heartbeat (`keepalive`) and a newer upstream event
+    /// (`response.metadata`) are both reported by serde as an unknown
+    /// top-level variant, so the stream can skip them instead of failing
+    /// the turn.
+    #[test]
+    fn unknown_top_level_events_are_detected() {
+        for data in [
+            r#"{"type":"keepalive","sequence_number":2}"#,
+            r#"{"type":"response.metadata","sequence_number":3}"#,
+        ] {
+            let err = match deserialize_response_event(data) {
+                Err(SamplingError::Serialization(err)) => err,
+                other => panic!("expected a serialization error, got {other:?}"),
+            };
+            assert!(
+                is_unknown_top_level_event(data, &err),
+                "{data} should be treated as a skippable unknown event"
+            );
+        }
+    }
+
+    /// An unknown variant *nested* inside an event we do model must stay a
+    /// hard error — silently dropping a malformed `response.completed` would
+    /// lose the turn's usage and terminal state.
+    #[test]
+    fn nested_unknown_variant_is_not_treated_as_unknown_event() {
+        let data = r#"{
+            "type": "response.completed",
+            "sequence_number": 0,
+            "response": {
+                "id": "resp_1",
+                "object": "response",
+                "created_at": 0,
+                "model": "grok-build",
+                "status": "not_a_real_status",
+                "output": [],
+                "parallel_tool_calls": false,
+                "tool_choice": "auto",
+                "tools": []
+            }
+        }"#;
+        let Err(SamplingError::Serialization(err)) = deserialize_response_event(data) else {
+            panic!("expected an unknown-variant serialization error");
+        };
+        assert!(
+            !is_unknown_top_level_event(data, &err),
+            "a nested unknown variant must not be mistaken for an unknown event type"
         );
     }
 
