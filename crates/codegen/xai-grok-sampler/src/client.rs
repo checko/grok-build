@@ -109,6 +109,28 @@ impl GrokRequestHeaders<'_> {
 /// document's own top-level `type`, so an unknown variant nested somewhere
 /// inside an event we care about (say a `response.completed`) still surfaces
 /// as a hard error instead of being silently dropped.
+/// Whether `base_url` points at an endpoint that can serve xAI-proprietary
+/// hosted tools.
+///
+/// Backend search ships two hosted tools whenever a model sets
+/// `supports_backend_search`: `web_search`, which is part of the Responses
+/// API that any compatible provider implements, and `x_search`, which is
+/// xAI-only. A third-party Responses endpoint is a legitimate target for the
+/// former but rejects the latter with `400 Unsupported tool type: x_search` —
+/// and because that fails request validation, it takes down every turn, not
+/// just searches. Send `x_search` only where it exists.
+///
+/// `web_search` is unaffected: it ships as a native `rs::Tool` rather than
+/// through the raw-JSON injection this gates.
+fn endpoint_serves_xai_hosted_tools(base_url: &str) -> bool {
+    reqwest::Url::parse(base_url)
+        .ok()
+        .and_then(|url| url.host_str().map(str::to_owned))
+        .is_some_and(|host| {
+            host == "x.ai" || host.ends_with(".x.ai") || host.ends_with(".grok.com")
+        })
+}
+
 /// Backfill `action` on an in-progress `web_search_call` output item.
 ///
 /// async-openai models `WebSearchToolCall::action` as required, but the
@@ -1999,8 +2021,13 @@ impl SamplingClient {
         let x_grok_agent_id = request.x_grok_agent_id.clone();
 
         // Collect xAI-specific tools that can't be expressed via rs::Tool
-        // (e.g., x_search). These are injected as raw JSON after serialization.
-        let extra_tools = xai_grok_sampling_types::extra_tool_entries(&request.hosted_tools);
+        // (e.g., x_search). These are injected as raw JSON after serialization,
+        // and only for an endpoint that can actually serve them.
+        let extra_tools = if endpoint_serves_xai_hosted_tools(&self.base_url) {
+            xai_grok_sampling_types::extra_tool_entries(&request.hosted_tools)
+        } else {
+            Vec::new()
+        };
 
         let responses_request: rs::CreateResponse = (&request).into();
 
@@ -2924,6 +2951,33 @@ mod tests {
             assert!(
                 is_unknown_top_level_event(data, &err),
                 "{data} should be treated as a skippable unknown event"
+            );
+        }
+    }
+
+    /// `x_search` ships only to xAI-operated endpoints; a third-party
+    /// Responses endpoint would reject the whole request over it.
+    #[test]
+    fn xai_hosted_tools_only_ship_to_xai_endpoints() {
+        for url in [
+            "https://api.x.ai/v1",
+            "https://x.ai/v1",
+            "https://cli-chat-proxy.grok.com/v1",
+        ] {
+            assert!(
+                endpoint_serves_xai_hosted_tools(url),
+                "{url} is xAI-operated"
+            );
+        }
+        for url in [
+            "http://100.70.0.91:18890/v1",
+            "https://api.openai.com/v1",
+            "http://localhost:8080/v1",
+            "not a url",
+        ] {
+            assert!(
+                !endpoint_serves_xai_hosted_tools(url),
+                "{url} cannot serve x_search"
             );
         }
     }
