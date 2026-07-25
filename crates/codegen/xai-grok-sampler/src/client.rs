@@ -109,6 +109,46 @@ impl GrokRequestHeaders<'_> {
 /// document's own top-level `type`, so an unknown variant nested somewhere
 /// inside an event we care about (say a `response.completed`) still surfaces
 /// as a hard error instead of being silently dropped.
+/// Backfill `action` on an in-progress `web_search_call` output item.
+///
+/// async-openai models `WebSearchToolCall::action` as required, but the
+/// backend only sends it once the call finishes: the `response.output_item
+/// .added` item is just `{id, type, status: "searching"}`, and the real
+/// action (with the query) arrives on `response.output_item.done`. Without
+/// this, the first event of every server-side search fails the turn with
+/// ``missing field `action` ``.
+///
+/// The placeholder is only ever substituted for an item that carries no
+/// action of its own, so a real action is never overwritten.
+fn backfill_web_search_call_action(value: &mut serde_json::Value) {
+    fn backfill(item: &mut serde_json::Value) {
+        if item.get("type").and_then(serde_json::Value::as_str) != Some("web_search_call") {
+            return;
+        }
+        if item.get("action").is_some() {
+            return;
+        }
+        if let Some(object) = item.as_object_mut() {
+            object.insert(
+                "action".to_string(),
+                serde_json::json!({ "type": "search", "query": "" }),
+            );
+        }
+    }
+
+    if let Some(item) = value.get_mut("item") {
+        backfill(item);
+    }
+    if let Some(output) = value
+        .pointer_mut("/response/output")
+        .and_then(|v| v.as_array_mut())
+    {
+        for item in output {
+            backfill(item);
+        }
+    }
+}
+
 fn is_unknown_top_level_event(data: &str, err: &serde_json::Error) -> bool {
     let message = err.to_string();
     let Some(rest) = message.strip_prefix("unknown variant `") else {
@@ -141,6 +181,7 @@ fn deserialize_response_event(data: &str) -> Result<rs::ResponseStreamEvent> {
                 {
                     tools.retain(|t| serde_json::from_value::<rs::Tool>(t.clone()).is_ok());
                 }
+                backfill_web_search_call_action(&mut value);
                 if let Ok(mut event) = serde_json::from_value::<rs::ResponseStreamEvent>(value) {
                     apply_terminal_event_overrides(&mut event, data);
                     return Ok(event);
@@ -2885,6 +2926,27 @@ mod tests {
                 "{data} should be treated as a skippable unknown event"
             );
         }
+    }
+
+    /// A server-side search opens with an `output_item.added` whose
+    /// `web_search_call` carries no `action`; it must still parse. The
+    /// matching `.done`, which does carry an action, must keep the real one.
+    #[test]
+    fn in_progress_web_search_call_without_action_parses() {
+        let added = r#"{"type":"response.output_item.added","output_index":0,"sequence_number":2,
+            "item":{"id":"ws_1","type":"web_search_call","status":"searching"}}"#;
+        deserialize_response_event(added).expect("in-progress web_search_call should parse");
+
+        let done = r#"{"type":"response.output_item.done","output_index":0,"sequence_number":5,
+            "item":{"id":"ws_1","type":"web_search_call","status":"completed",
+            "action":{"type":"search","query":"current node version"}}}"#;
+        let event = deserialize_response_event(done).expect("completed web_search_call should parse");
+        let json = serde_json::to_value(&event).expect("event re-serializes");
+        assert_eq!(
+            json.pointer("/item/action/query").and_then(|v| v.as_str()),
+            Some("current node version"),
+            "the real action must not be replaced by the placeholder"
+        );
     }
 
     /// An unknown variant *nested* inside an event we do model must stay a
