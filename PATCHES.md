@@ -21,6 +21,12 @@ main                                ← untouched mirror of upstream/main
 `main` is never patched. It is kept byte-identical to `upstream/main` so the
 patch branch can always be replayed onto a fresh upstream with a plain rebase.
 
+The branch additionally carries one build-tooling commit, `c446dfc`, which makes
+`cargo build` work on Windows. It touches
+`crates/build/xai-proto-build/src/lib.rs` and does not affect generated code or
+the Linux build — see [WINDOWS-BUILD.md](WINDOWS-BUILD.md). A rebase therefore
+has two files that could conflict, not one.
+
 Remotes:
 
 | remote | URL |
@@ -80,6 +86,11 @@ cargo test -p xai-grok-sampler --lib -- \
 
 The target machine is assumed to already have stock `grok` installed, so that
 `~/.grok/bin/` and `~/.grok/downloads/` exist.
+
+Both options below are Linux-only. **On Windows, see
+[WINDOWS-BUILD.md](WINDOWS-BUILD.md)** — the toolchain setup differs, three
+build-level problems have to be worked around, and `~/.grok/bin` holds real file
+copies rather than symlinks.
 
 ### Option A — copy the built binary (fast)
 
