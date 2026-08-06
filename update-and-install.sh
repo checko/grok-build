@@ -21,20 +21,39 @@ fi
 echo "==> fetching upstream"
 git fetch upstream
 
+# Unconditionally, and before the up-to-date test: otherwise running this
+# from `main` while upstream is current would build and install `main` under
+# the `-patched-` name, silently replacing the patched binary with a stock one.
+git checkout "$BRANCH"
+
 before="$(git rev-parse HEAD)"
 if [[ "$(git rev-parse upstream/main)" == "$(git merge-base HEAD upstream/main)" ]]; then
   echo "==> already up to date with upstream/main"
 else
   echo "==> rebasing $BRANCH onto upstream/main"
-  git checkout "$BRANCH"
   # Conflicts, if any, land in the two patched files. Resolve them, run
   # `git rebase --continue`, then re-run this script.
   git rebase upstream/main
 fi
 
 echo "==> testing the patches"
+test_log="$(mktemp)"
+trap 'rm -f "$test_log"' EXIT
 cargo test -p xai-grok-sampler --lib -- \
-  unknown_top_level nested_unknown web_search_call xai_hosted deserialize_response_event
+  unknown_top_level nested_unknown web_search_call xai_hosted deserialize_response_event \
+  2>&1 | tee "$test_log"
+
+# `cargo test` exits 0 when a filter matches no tests, so a green run proves
+# nothing on its own. Confirm each patch test actually reported ok.
+for t in unknown_top_level_events_are_detected \
+         nested_unknown_variant_is_not_treated_as_unknown_event \
+         in_progress_web_search_call_without_action_parses \
+         xai_hosted_tools_only_ship_to_xai_endpoints; do
+  if ! grep -q "test client::tests::${t} \.\.\. ok" "$test_log"; then
+    echo "error: patch test '$t' did not run — are the patches present?" >&2
+    exit 1
+  fi
+done
 
 echo "==> building (a few minutes)"
 cargo build -p xai-grok-pager-bin --release
