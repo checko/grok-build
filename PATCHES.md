@@ -6,8 +6,10 @@ so that `grok` works against an **OpenAI-compatible passthrough gateway** using 
 
 Stock `grok` fails against such a gateway in three separate ways. Each patch fixes
 one of them. All three are confined to a single file,
-`crates/codegen/xai-grok-sampler/src/client.rs`, which is deliberate: that file
-changes rarely upstream, so rebasing stays cheap.
+`crates/codegen/xai-grok-sampler/src/client.rs`, which is deliberate: keeping the
+blast radius to one file keeps rebases cheap. That file does churn upstream —
+the 0.2.112 → 0.2.120 sync rewrote 490 of its lines — but the patches sit in
+distinct enough regions that the rebases have so far been conflict-free.
 
 ## Branch layout
 
@@ -30,10 +32,21 @@ Remotes:
 
 | commit | fix |
 |---|---|
-| `e152220` | Skip unknown Responses stream events instead of failing the turn |
-| `a8d8d2b` | Backfill `action` on in-progress `web_search_call` items |
-| `14bcdfd` | Send `x_search` only to xAI-operated endpoints |
-| `ad6fc19` | Add `update-and-install.sh` |
+| `84ba2c9` | Skip unknown Responses stream events instead of failing the turn |
+| `451f7c8` | Backfill `action` on in-progress `web_search_call` items |
+| `68aa33c` | Send `x_search` only to xAI-operated endpoints |
+| `a19943f` | Add `update-and-install.sh` |
+
+Rebasing rewrites those SHAs every time, so they are indicative only — read the
+live stack with `git log --oneline upstream/main..HEAD`. The table above is as
+of the rebase onto upstream `a5589e9` (v0.2.120).
+
+**None of the three has been adopted upstream as of v0.2.120.** Verified there:
+`deserialize_response_event` still strips only unparseable `/response/tools`
+entries and returns `SamplingError::Serialization` on everything else;
+`retry.rs` still classifies that error as fatal on the first attempt; and
+`extra_tool_entries` is still called with no host gate. Expect to keep carrying
+these.
 
 **1. Unknown SSE events.** The `async-openai` fork models Responses-API stream
 events as a closed `enum`. A gateway that emits any event type outside that enum
@@ -93,7 +106,10 @@ Repoint **both** symlinks — `agent` is what subagent spawns exec.
 ### Option B — build from source (any arch, stays current)
 
 ```bash
-# Rust 1.92.0; pinned in rust-toolchain.toml, so rustup selects it automatically
+# The toolchain is pinned in rust-toolchain.toml (1.94.0 as of v0.2.120) and
+# rustup installs and selects it per-directory on the first `cargo` command.
+# Never run `rustup update` for this — the pin is an exact version and the
+# `stable` channel is unrelated.
 curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
 
 git clone git@github.com:checko/grok-build.git grok-build-src
@@ -109,8 +125,12 @@ git config user.email "checko@gmail.com"
 ./update-and-install.sh
 ```
 
-Budget roughly 3–4 minutes for the release build and **26 GB** of disk for
-`target/`.
+Budget **26 GB** of disk for `target/` and roughly 3–4 minutes for a warm
+release build. When upstream bumps `rust-toolchain.toml`, every fingerprint in
+`target/` is invalidated and the build is cold — measured at **6m 03s** for the
+1.92.0 → 1.94.0 bump. Cargo does not garbage-collect the superseded artifacts,
+so `target/` grows across a toolchain bump; `cargo clean` first if disk is
+tight.
 
 ### Required configuration
 
@@ -138,8 +158,8 @@ setting defaults to true).
 
 ```bash
 grok update --check
-# Grok Build - v0.2.112 (latest: 0.2.112) [stable]                        ← current
-# A new version of Grok Build is available: 0.2.112 -> 0.2.113 [stable]   ← rebuild
+# Grok Build - v0.2.120 (latest: 0.2.120)                        ← current
+# A new version of Grok Build is available: 0.2.120 -> 0.2.121   ← rebuild
 ```
 
 This works despite the pin because `check_update_status`
@@ -163,6 +183,17 @@ buildable. If the first says yes and the second says 0, wait and re-check.
 
 Nothing is scheduled — no cron entry, no systemd timer. Both checks are manual.
 
+### Why `--version` says `[alpha]`
+
+A self-built binary reports e.g. `grok 0.2.120 (3c5009f) [alpha]`. That label is
+cosmetic and does **not** mean the build is on the alpha channel.
+`channel_label()` (`crates/codegen/xai-grok-update/src/version.rs:554`) compares
+the compiled version against the `stable_version` cached in
+`~/.grok/version.json` and labels anything ahead of it as alpha. Because
+`auto_update = false` stops that cache being refreshed, the pointer stays frozen
+at whatever the last stock install wrote, and every locally-built version will
+read `[alpha]` from then on. Nothing is affected functionally.
+
 ## Updating
 
 ```bash
@@ -174,34 +205,27 @@ The script:
 
 1. refuses to run on a dirty working tree
 2. `git fetch upstream`
-3. rebases this branch onto `upstream/main` (skipped when already current)
-4. runs the four patch tests
-5. `cargo build -p xai-grok-pager-bin --release`
-6. copies to `~/.grok/downloads/grok-<version>-patched-linux-x86_64` and repoints
+3. checks out this branch (unconditionally — see below)
+4. rebases it onto `upstream/main` (skipped when already current)
+5. runs the patch tests, then asserts by name that all four actually reported
+   `ok` — `cargo test` exits 0 when a filter matches nothing, so the exit status
+   alone would not prove the patches are present
+6. `cargo build -p xai-grok-pager-bin --release`
+7. copies to `~/.grok/downloads/grok-<version>-patched-linux-x86_64` and repoints
    `bin/grok` and `bin/agent`
-7. prints the new version and the rollback command
+8. prints the new version and the rollback command
+
+Step 3 used to sit inside the else-branch of the up-to-date test, so running the
+script from `main` while upstream was current would build `main` and install it
+under the `-patched-` name — quietly replacing the patched binary with a stock
+one. Both that and the silently-vacuous test run are fixed; the checkout is now
+unconditional and step 5 fails loudly if a patch test is missing.
 
 It never pushes. To publish the rebased branch afterwards, note that rebasing
 rewrites the commit SHAs, so a plain push is rejected:
 
 ```bash
 git push --force-with-lease origin patch/tolerate-unknown-sse-events
-```
-
-### Known issue
-
-`git checkout "$BRANCH"` sits inside the else-branch of the up-to-date test
-(`update-and-install.sh:29`), so it only runs when there is something to rebase.
-If you invoke the script while on `main` and upstream is already current, it
-builds **`main`** and installs it under the `-patched-` name — silently replacing
-the patched binary with an unpatched one. The test step does not catch this:
-`cargo test` exits 0 when a filter matches no tests, so the four patch tests
-simply report "0 passed".
-
-Until that is fixed, confirm the branch before running:
-
-```bash
-git rev-parse --abbrev-ref HEAD    # must be patch/tolerate-unknown-sse-events
 ```
 
 ### If a rebase conflicts
