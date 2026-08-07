@@ -21,7 +21,7 @@ main                                ← untouched mirror of upstream/main
 `main` is never patched. It is kept byte-identical to `upstream/main` so the
 patch branch can always be replayed onto a fresh upstream with a plain rebase.
 
-The branch additionally carries one build-tooling commit, `c446dfc`, which makes
+The branch additionally carries one build-tooling commit, `062af90`, which makes
 `cargo build` work on Windows. It touches
 `crates/build/xai-proto-build/src/lib.rs` and does not affect generated code or
 the Linux build — see [WINDOWS-BUILD.md](WINDOWS-BUILD.md). A rebase therefore
