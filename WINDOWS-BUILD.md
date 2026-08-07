@@ -7,7 +7,7 @@ are handled by `build-and-install-windows.ps1`; this file explains what they are
 so the workarounds are not cargo-cult.
 
 Target: `x86_64-pc-windows-msvc`. Verified on Windows 11 Pro 26200, producing
-`grok 0.2.112 (35ec58a)`.
+`grok 0.2.120 (1869035)`.
 
 ## Prerequisites
 
@@ -93,7 +93,7 @@ protoc with `--dependency_out=/dev/stdout --descriptor_set_out=/dev/null` and
 parsed the result off stdout. Neither device path exists on Windows, so protoc
 exited with `/dev/stdout: No such file or directory`.
 
-Fixed in-tree (commit `c446dfc`): both outputs go to scratch files under
+Fixed in-tree (commit `062af90`): both outputs go to scratch files under
 `OUT_DIR` on every platform, the dependency list is read back from that file,
 and the prefix check matches the real descriptor path instead of the literal
 `/dev/null:`. The well-known-types filter also accepts backslash-separated
@@ -173,7 +173,7 @@ copies**, unlike the Linux layout described in `PATCHES.md`. `agent.exe` is what
 spawned subagents exec, so it must be replaced too.
 
 ```powershell
-$v   = "0.2.112"
+$v   = "0.2.120"
 $art = "$env:USERPROFILE\.grok\downloads\grok-$v-patched-windows-x86_64.exe"
 
 Copy-Item target\release\xai-grok-pager.exe $art -Force
@@ -214,7 +214,7 @@ on that code path.
 ## Verifying
 
 ```powershell
-& "$env:USERPROFILE\.grok\bin\grok.exe" --version    # grok 0.2.112 (35ec58a) [stable]
+& "$env:USERPROFILE\.grok\bin\grok.exe" --version    # grok 0.2.120 (1869035) [stable]
 & "$env:USERPROFILE\.grok\bin\agent.exe" --version   # must match
 grok update --check                                  # read-only; never plain `grok update`
 
@@ -224,6 +224,25 @@ grok -p "Search the web for the latest stable release of PostgreSQL. Reply with 
 A reply carrying a live version plus a citation link confirms the whole path:
 hosted web search reached the gateway, the `web_search_call` items parsed, and
 the stream survived unknown SSE events.
+
+Two things in the `--version` output are not fixed values. The hash in
+parentheses is `git rev-parse --short HEAD` at build time (see
+`crates/codegen/xai-grok-pager-bin/build.rs`), so it is whatever the branch tip
+was — a docs commit added afterwards makes it an ancestor rather than HEAD.
+
+The channel label is a comparison, not a property of the build:
+`channel_label()` in `crates/codegen/xai-grok-update/src/version.rs` compares the
+compiled-in version against the `stable_version` cached in
+`~/.grok/version.json`, and reports `[alpha]` when ahead of it, `[stable]` when
+at or behind, and nothing at all when the cache is missing. A freshly installed
+build therefore reads `[alpha]` while that cache still holds the pointer from
+the previous version, and flips to `[stable]` as soon as anything refreshes it
+— `update --check` does, which is why the label can change between two
+consecutive `--version` runs without the binary changing. Here the check moved
+the cached pointer to `1.0.0`, putting `0.2.120` behind stable.
+
+Neither value affects the patches; `auto_update = false` is what keeps the
+binary from being replaced.
 
 ## Rebuilding after an upstream bump
 
@@ -236,3 +255,28 @@ Because the branch now carries a build-tooling commit in
 `crates/build/xai-proto-build/src/lib.rs` as well as the sampler patches in
 `crates/codegen/xai-grok-sampler/src/client.rs`, a rebase has two files that
 could conflict rather than one. Both change rarely upstream.
+
+If the rebase was done elsewhere — on Linux — and force-pushed, the Windows
+commits are simply gone from the remote branch, because the machine doing the
+rebase had no reason to carry them. Recovering them is a replay of the range
+above the last shared commit rather than a merge:
+
+```powershell
+git branch backup/pre-rebase HEAD                  # the old tip, hashes about to change
+git fetch origin --prune
+git rebase --onto origin/patch/tolerate-unknown-sse-events <last-shared-commit> `
+    patch/tolerate-unknown-sse-events
+```
+
+`<last-shared-commit>` is the last commit the two branches agree on — the one
+just below the Windows commits (`35ec58a` in the 0.2.112 → 0.2.120 rebase).
+Everything above it gets replayed onto the new upstream tip. Verify with
+`git diff --stat origin/patch/tolerate-unknown-sse-events..HEAD`: the result
+should be exactly the four files this branch adds on Windows, and nothing else.
+
+One thing worth re-checking on each bump: whether new upstream code invokes
+protoc itself. The 0.2.120 sync added `crates/build/xai-proto-build/src/debug_redact.rs`,
+which does — but it writes its descriptor set to a `tempfile::TempDir` rather
+than `/dev/null`, so it is already portable and needs no patch. A future module
+that reaches for `/dev/null` again would fail on Windows the same way
+`emit_rerun_if_changed` did.
