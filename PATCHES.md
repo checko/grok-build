@@ -7,9 +7,9 @@ so that `grok` works against an **OpenAI-compatible passthrough gateway** using 
 Stock `grok` fails against such a gateway in three separate ways. Each patch fixes
 one of them. All three are confined to a single file,
 `crates/codegen/xai-grok-sampler/src/client.rs`, which is deliberate: keeping the
-blast radius to one file keeps rebases cheap. That file does churn upstream —
-the 0.2.112 → 0.2.120 sync rewrote 490 of its lines — but the patches sit in
-distinct enough regions that the rebases have so far been conflict-free.
+blast radius to one file keeps rebases cheap. That file churns upstream — the
+0.2.112 → 0.2.120 sync rewrote 490 of its lines — and the 0.2.120 → 1.0.5 sync
+produced the first real conflict, so budget for one every few cycles.
 
 ## Branch layout
 
@@ -38,21 +38,20 @@ Remotes:
 
 | commit | fix |
 |---|---|
-| `84ba2c9` | Skip unknown Responses stream events instead of failing the turn |
-| `451f7c8` | Backfill `action` on in-progress `web_search_call` items |
-| `68aa33c` | Send `x_search` only to xAI-operated endpoints |
-| `a19943f` | Add `update-and-install.sh` |
+| `bef1d6e` | Skip unknown Responses stream events instead of failing the turn |
+| `468d948` | Backfill `action` on in-progress `web_search_call` items |
+| `de22331` | Send `x_search` only to xAI-operated endpoints |
+| `8346d14` | Add `update-and-install.sh` |
 
 Rebasing rewrites those SHAs every time, so they are indicative only — read the
 live stack with `git log --oneline upstream/main..HEAD`. The table above is as
-of the rebase onto upstream `a5589e9` (v0.2.120).
+of the rebase onto upstream `d92c5b0` (v1.0.5).
 
-**None of the three has been adopted upstream as of v0.2.120.** Verified there:
+**None of the three has been adopted upstream as of v1.0.5.** Verified there:
 `deserialize_response_event` still strips only unparseable `/response/tools`
-entries and returns `SamplingError::Serialization` on everything else;
-`retry.rs` still classifies that error as fatal on the first attempt; and
-`extra_tool_entries` is still called with no host gate. Expect to keep carrying
-these.
+entries and returns `SamplingError::Serialization` on everything else
+(`client.rs:130`); `retry.rs:919` still classifies that error as fatal on the
+first attempt; and nothing backfills `action`. Expect to keep carrying these.
 
 **1. Unknown SSE events.** The `async-openai` fork models Responses-API stream
 events as a closed `enum`. A gateway that emits any event type outside that enum
@@ -70,10 +69,28 @@ aborting the turn as soon as a search begins. The patch backfills a placeholder
 
 **3. `x_search` sent to non-xAI endpoints.** `grok` injects xAI's proprietary
 `x_search` hosted tool alongside `web_search`. A non-xAI endpoint rejects the
-whole request with `HTTP 400 Unsupported tool type: x_search`. The patch gates
-xAI-only hosted tools on the endpoint host, so they ship to `*.x.ai` and
+whole request with `HTTP 400 Unsupported tool type: x_search` — and because that
+fails request validation it kills every turn, not just searches. The patch
+filters xAI-only hosted tools by the endpoint host, so they ship to `*.x.ai` and
 `*.grok.com` but not to third-party gateways. Nothing needs configuring — the
 host is read from `base_url`.
+
+> **Read this before touching patch 3.** The filter must stay **per tool**.
+> Through v0.2.120 `web_search` shipped as a native `rs::Tool::WebSearch` and
+> only `x_search` rode the raw-JSON `extra_tool_entries` channel, so gating the
+> whole call was equivalent. As of v1.0.5 both ride that channel — `web_search`
+> moved because async-openai's typed `WebSearchToolFilters` cannot express
+> `excluded_domains` (`conversation/responses.rs:352-361`) — so skipping the
+> call now drops hosted web search along with `x_search`, silently. The endpoint
+> filter therefore lives in `extra_tool_entries_for_endpoint`, which drops
+> entries by `HostedTool::wire_name()` and is applied at **both** call sites:
+> `conversation_stream_responses` and the non-streaming `conversation_responses`
+> that upstream added in 1.0.5.
+>
+> `non_xai_endpoints_keep_web_search_and_drop_x_search` is the regression test
+> for exactly this. The older `xai_hosted_tools_only_ship_to_xai_endpoints`
+> covers only the host predicate and keeps passing when the filter is wrong, so
+> it is not a substitute.
 
 Four unit tests cover the patches. Run them with:
 
@@ -117,7 +134,7 @@ Repoint **both** symlinks — `agent` is what subagent spawns exec.
 ### Option B — build from source (any arch, stays current)
 
 ```bash
-# The toolchain is pinned in rust-toolchain.toml (1.94.0 as of v0.2.120) and
+# The toolchain is pinned in rust-toolchain.toml (1.94.0 as of v1.0.5) and
 # rustup installs and selects it per-directory on the first `cargo` command.
 # Never run `rustup update` for this — the pin is an exact version and the
 # `stable` channel is unrelated.
@@ -169,8 +186,8 @@ setting defaults to true).
 
 ```bash
 grok update --check
-# Grok Build - v0.2.120 (latest: 0.2.120)                        ← current
-# A new version of Grok Build is available: 0.2.120 -> 0.2.121   ← rebuild
+# Grok Build - v1.0.5 (latest: 1.0.5)                        ← current
+# A new version of Grok Build is available: 1.0.5 -> 1.0.6   ← rebuild
 ```
 
 This works despite the pin because `check_update_status`
@@ -196,7 +213,7 @@ Nothing is scheduled — no cron entry, no systemd timer. Both checks are manual
 
 ### Why `--version` says `[alpha]`
 
-A self-built binary reports e.g. `grok 0.2.120 (3c5009f) [alpha]`. That label is
+A self-built binary reports e.g. `grok 1.0.5 (09ecb20) [alpha]`. That label is
 cosmetic and does **not** mean the build is on the alpha channel.
 `channel_label()` (`crates/codegen/xai-grok-update/src/version.rs:554`) compares
 the compiled version against the `stable_version` cached in
@@ -218,7 +235,7 @@ The script:
 2. `git fetch upstream`
 3. checks out this branch (unconditionally — see below)
 4. rebases it onto `upstream/main` (skipped when already current)
-5. runs the patch tests, then asserts by name that all four actually reported
+5. runs the patch tests, then asserts by name that all five actually reported
    `ok` — `cargo test` exits 0 when a filter matches nothing, so the exit status
    alone would not prove the patches are present
 6. `cargo build -p xai-grok-pager-bin --release`
@@ -241,7 +258,8 @@ git push --force-with-lease origin patch/tolerate-unknown-sse-events
 
 ### If a rebase conflicts
 
-Conflicts can only realistically appear in `client.rs`. Resolve, then:
+Conflicts can appear in `client.rs` or, on Windows, `xai-proto-build/src/lib.rs`.
+Resolve, then:
 
 ```bash
 git rebase --continue
@@ -249,6 +267,13 @@ git rebase --continue
 ```
 
 To bail out entirely: `git rebase --abort`.
+
+Resolving a conflict is not enough on its own when upstream has moved the code
+the patch depends on. The v1.0.5 rebase conflicted on one comment, and taking
+the patch side verbatim would have compiled, passed the old tests, and silently
+disabled hosted web search — see the warning under patch 3. When a conflict
+lands in `client.rs`, re-read what the surrounding upstream code now does before
+deciding the resolution is mechanical.
 
 ## Rollback
 
