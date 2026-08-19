@@ -40,7 +40,8 @@ echo "==> testing the patches"
 test_log="$(mktemp)"
 trap 'rm -f "$test_log"' EXIT
 cargo test -p xai-grok-sampler --lib -- \
-  unknown_top_level nested_unknown web_search_call xai_hosted deserialize_response_event \
+  unknown_top_level nested_unknown web_search_call xai_hosted non_xai_endpoints \
+  deserialize_response_event \
   2>&1 | tee "$test_log"
 
 # `cargo test` exits 0 when a filter matches no tests, so a green run proves
@@ -48,7 +49,8 @@ cargo test -p xai-grok-sampler --lib -- \
 for t in unknown_top_level_events_are_detected \
          nested_unknown_variant_is_not_treated_as_unknown_event \
          in_progress_web_search_call_without_action_parses \
-         xai_hosted_tools_only_ship_to_xai_endpoints; do
+         xai_hosted_tools_only_ship_to_xai_endpoints \
+         non_xai_endpoints_keep_web_search_and_drop_x_search; do
   if ! grep -q "test client::tests::${t} \.\.\. ok" "$test_log"; then
     echo "error: patch test '$t' did not run — are the patches present?" >&2
     exit 1
