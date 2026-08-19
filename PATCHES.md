@@ -176,8 +176,9 @@ auto_update = false                # REQUIRED — see below
 
 `auto_update = false` is not optional. Without it the updater downloads a stock
 release and silently overwrites the `~/.grok/bin/grok` symlink on a later launch
-(short-circuit at `crates/codegen/xai-grok-update/src/auto_update.rs:468`; the
-setting defaults to true).
+(short-circuits at `crates/codegen/xai-grok-update/src/auto_update.rs:612` in
+`check_update_background` and `:705` in `run_update_if_available`; the setting
+defaults to true when unset).
 
 ## Checking for updates
 
@@ -211,16 +212,25 @@ buildable. If the first says yes and the second says 0, wait and re-check.
 
 Nothing is scheduled — no cron entry, no systemd timer. Both checks are manual.
 
-### Why `--version` says `[alpha]`
+### The `[alpha]` / `[stable]` / no-label suffix on `--version`
 
-A self-built binary reports e.g. `grok 1.0.5 (09ecb20) [alpha]`. That label is
-cosmetic and does **not** mean the build is on the alpha channel.
-`channel_label()` (`crates/codegen/xai-grok-update/src/version.rs:554`) compares
-the compiled version against the `stable_version` cached in
-`~/.grok/version.json` and labels anything ahead of it as alpha. Because
-`auto_update = false` stops that cache being refreshed, the pointer stays frozen
-at whatever the last stock install wrote, and every locally-built version will
-read `[alpha]` from then on. Nothing is affected functionally.
+Whatever `--version` prints after the SHA is cosmetic and says nothing about
+which channel the build came from. `channel_label()`
+(`crates/codegen/xai-grok-update/src/version.rs:589`) compares the compiled
+version against the `stable_version` cached in `~/.grok/version.json`: ahead of
+it reads `[alpha]`, equal reads `[stable]`, and **no cached pointer at all reads
+as the empty string** (`version.rs:518`).
+
+All three show up in practice. A self-built binary sitting on a stale cache
+written by an older stock install reads `[alpha]`. After a `grok update --check`
+the cache is rewritten, and if the fetch of the stable pointer fails or is
+skipped, `stable_version` lands as `null` and the label disappears entirely —
+`grok 1.0.5 (22bb97d)` with no suffix, which is what a current build normally
+looks like here.
+
+Note `auto_update = false` does **not** freeze this cache: `check_update_status`
+never consults that setting, so any `grok update --check` refreshes it. Nothing
+about any of this affects behaviour.
 
 ## Updating
 
