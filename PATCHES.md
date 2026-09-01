@@ -8,8 +8,9 @@ Stock `grok` fails against such a gateway in three separate ways. Each patch fix
 one of them. All three are confined to a single file,
 `crates/codegen/xai-grok-sampler/src/client.rs`, which is deliberate: keeping the
 blast radius to one file keeps rebases cheap. That file churns upstream — the
-0.2.112 → 0.2.120 sync rewrote 490 of its lines — and the 0.2.120 → 1.0.5 sync
-produced the first real conflict, so budget for one every few cycles.
+0.2.112 → 0.2.120 sync rewrote 490 of its lines — and every sync since has
+conflicted: 0.2.120 → 1.0.5 on one comment, 1.0.5 → 1.0.13 on four hunks. Budget
+for a conflict every cycle now, not every few.
 
 ## Branch layout
 
@@ -38,20 +39,25 @@ Remotes:
 
 | commit | fix |
 |---|---|
-| `bef1d6e` | Skip unknown Responses stream events instead of failing the turn |
-| `468d948` | Backfill `action` on in-progress `web_search_call` items |
-| `de22331` | Send `x_search` only to xAI-operated endpoints |
-| `8346d14` | Add `update-and-install.sh` |
+| `2a789c0` | Skip unknown Responses stream events instead of failing the turn |
+| `5a87d5b` | Backfill `action` on in-progress `web_search_call` items |
+| `dcda06b` | Send `x_search` only to xAI-operated endpoints |
+| `98d16a5` | Add `update-and-install.sh` |
 
 Rebasing rewrites those SHAs every time, so they are indicative only — read the
 live stack with `git log --oneline upstream/main..HEAD`. The table above is as
-of the rebase onto upstream `d92c5b0` (v1.0.5).
+of the rebase onto upstream `bb7f39d5` (v1.0.13).
 
-**None of the three has been adopted upstream as of v1.0.5.** Verified there:
+**None of the three has been adopted upstream as of v1.0.13.** Verified there:
 `deserialize_response_event` still strips only unparseable `/response/tools`
 entries and returns `SamplingError::Serialization` on everything else
-(`client.rs:130`); `retry.rs:919` still classifies that error as fatal on the
+(`client.rs:240`); `retry.rs:209` still classifies that error as fatal on the
 first attempt; and nothing backfills `action`. Expect to keep carrying these.
+
+Note 1.0.13 added automatic retry for transient inference failures and for
+length-truncated responses. That is adjacent to patch 1 but does not replace it:
+a serialization error is still classified fatal on the first attempt, so an
+unknown SSE event still kills the turn without the patch.
 
 **1. Unknown SSE events.** The `async-openai` fork models Responses-API stream
 events as a closed `enum`. A gateway that emits any event type outside that enum
@@ -80,7 +86,7 @@ host is read from `base_url`.
 > only `x_search` rode the raw-JSON `extra_tool_entries` channel, so gating the
 > whole call was equivalent. As of v1.0.5 both ride that channel — `web_search`
 > moved because async-openai's typed `WebSearchToolFilters` cannot express
-> `excluded_domains` (`conversation/responses.rs:352-361`) — so skipping the
+> `excluded_domains` (`conversation/responses.rs:345`) — so skipping the
 > call now drops hosted web search along with `x_search`, silently. The endpoint
 > filter therefore lives in `extra_tool_entries_for_endpoint`, which drops
 > entries by `HostedTool::wire_name()` and is applied at **both** call sites:
@@ -92,12 +98,15 @@ host is read from `base_url`.
 > covers only the host predicate and keeps passing when the filter is wrong, so
 > it is not a substitute.
 
-Four unit tests cover the patches. Run them with:
+Five unit tests cover the patches. Run them with:
 
 ```bash
 cargo test -p xai-grok-sampler --lib -- \
-  unknown_top_level nested_unknown web_search_call xai_hosted
+  unknown_top_level nested_unknown web_search_call xai_hosted non_xai_endpoints
 ```
+
+Omitting `non_xai_endpoints` leaves patch 3's real regression test unrun, which
+is the mistake the filter above exists to catch.
 
 ## Installing on another machine
 
@@ -134,7 +143,7 @@ Repoint **both** symlinks — `agent` is what subagent spawns exec.
 ### Option B — build from source (any arch, stays current)
 
 ```bash
-# The toolchain is pinned in rust-toolchain.toml (1.94.0 as of v1.0.5) and
+# The toolchain is pinned in rust-toolchain.toml (1.94.0 as of v1.0.13) and
 # rustup installs and selects it per-directory on the first `cargo` command.
 # Never run `rustup update` for this — the pin is an exact version and the
 # `stable` channel is unrelated.
@@ -176,9 +185,9 @@ auto_update = false                # REQUIRED — see below
 
 `auto_update = false` is not optional. Without it the updater downloads a stock
 release and silently overwrites the `~/.grok/bin/grok` symlink on a later launch
-(short-circuits at `crates/codegen/xai-grok-update/src/auto_update.rs:612` in
-`check_update_background` and `:705` in `run_update_if_available`; the setting
-defaults to true when unset).
+(short-circuits at `crates/codegen/xai-grok-update/src/auto_update.rs:593` in
+`check_update_background` and `:682` in `run_update_if_available`; the setting
+defaults to true when unset — `auto_update.rs:687`).
 
 ## Checking for updates
 
@@ -187,12 +196,12 @@ defaults to true when unset).
 
 ```bash
 grok update --check
-# Grok Build - v1.0.5 (latest: 1.0.5)                        ← current
-# A new version of Grok Build is available: 1.0.5 -> 1.0.6   ← rebuild
+# Grok Build - v1.0.13 (latest: 1.0.13)                        ← current
+# A new version of Grok Build is available: 1.0.13 -> 1.0.14   ← rebuild
 ```
 
 This works despite the pin because `check_update_status`
-(`crates/codegen/xai-grok-update/src/auto_update.rs:102`) never consults
+(`crates/codegen/xai-grok-update/src/auto_update.rs:224`) never consults
 `auto_update`. Add `--json` for scripting.
 
 > **Never run plain `grok update`.** With `installer = "internal"` it will
@@ -216,16 +225,16 @@ Nothing is scheduled — no cron entry, no systemd timer. Both checks are manual
 
 Whatever `--version` prints after the SHA is cosmetic and says nothing about
 which channel the build came from. `channel_label()`
-(`crates/codegen/xai-grok-update/src/version.rs:589`) compares the compiled
+(`crates/codegen/xai-grok-update/src/version.rs:551`) compares the compiled
 version against the `stable_version` cached in `~/.grok/version.json`: ahead of
 it reads `[alpha]`, equal reads `[stable]`, and **no cached pointer at all reads
-as the empty string** (`version.rs:518`).
+as the empty string** (`version.rs:557`).
 
 All three show up in practice. A self-built binary sitting on a stale cache
 written by an older stock install reads `[alpha]`. After a `grok update --check`
 the cache is rewritten, and if the fetch of the stable pointer fails or is
 skipped, `stable_version` lands as `null` and the label disappears entirely —
-`grok 1.0.5 (22bb97d)` with no suffix, which is what a current build normally
+`grok 1.0.13 (<tip>)` with no suffix, which is what a current build normally
 looks like here.
 
 Note `auto_update = false` does **not** freeze this cache: `check_update_status`
@@ -284,6 +293,24 @@ the patch side verbatim would have compiled, passed the old tests, and silently
 disabled hosted web search — see the warning under patch 3. When a conflict
 lands in `client.rs`, re-read what the surrounding upstream code now does before
 deciding the resolution is mechanical.
+
+**The 1.0.5 → 1.0.13 rebase.** Four conflict hunks, all in `client.rs`, all
+caused by upstream reflowing doc comments from multi-line blocks to single long
+lines — not by any logic change. Two in patch 1 (the `deserialize_response_event`
+doc, and the same doc restated above a test), two in patch 3 (the comment above
+each `extra_tool_entries` call site). Resolution in both patches: keep upstream's
+reflowed prose, re-apply our code. Patch 2 replayed clean.
+
+That reflow is why the sync's diffstat reads 2,525 files and +235k/-174k —
+roughly 120k of the 400k changed lines are `///` comments. Do not read the size
+as a signal of risk; check what actually moved.
+
+The premise of patch 3 was re-verified rather than assumed: `extra_tool_entries`
+(`conversation/responses.rs:348`) still emits both `web_search` and `x_search`
+onto the raw-JSON channel, and `HostedTool::wire_name()` (`conversation.rs:496`)
+is unchanged with no new variants. Do this check on every rebase — if a future
+sync moves `web_search` back to a typed `rs::Tool`, the per-tool filter needs
+revisiting.
 
 ## Rollback
 
